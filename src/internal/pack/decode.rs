@@ -2,8 +2,10 @@
 //! and populates caches/metadata for downstream consumers.
 
 use std::{
+    convert::TryInto,
+    fs::File,
     io::{self, BufRead, Cursor, ErrorKind, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -22,7 +24,7 @@ use uuid::Uuid;
 
 use crate::{
     errors::GitError,
-    hash::{ObjectHash, get_hash_kind, set_hash_kind},
+    hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind},
     internal::{
         metadata::{EntryMeta, MetaAttached},
         object::types::ObjectType,
@@ -75,6 +77,115 @@ struct SharedParams {
     pub caches: Arc<Caches>,
     pub cache_objs_mem_size: Arc<AtomicUsize>,
     pub callback: Arc<dyn Fn(MetaAttached<Entry, EntryMeta>) + Sync + Send>,
+}
+
+/// 统计 pack 文件中原始对象的数量
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PackStats {
+    pub total: usize,
+    pub commits: usize,
+    pub trees: usize,
+    pub blobs: usize,
+    pub tags: usize,
+    pub deltas: usize,
+}
+
+impl PackStats {
+    // 根据对象类型更新对应的统计计数
+    fn record(&mut self, obj_type: ObjectType) {
+        self.total += 1;
+        match obj_type {
+            ObjectType::Commit => self.commits += 1,
+            ObjectType::Tree => self.trees += 1,
+            ObjectType::Blob => self.blobs += 1,
+            ObjectType::Tag => self.tags += 1,
+            ObjectType::OffsetDelta | ObjectType::OffsetZstdelta | ObjectType::HashDelta => {
+                self.deltas += 1;
+            }
+            _ => {}
+        }
+    }
+}
+
+// 用于在临时切换哈希类型后，自动恢复原来的哈希类型
+struct HashKindRestore(crate::hash::HashKind);
+
+impl Drop for HashKindRestore {
+    fn drop(&mut self) {
+        set_hash_kind(self.0);
+    }
+}
+
+// 尝试通过同名 .idx 文件推断 pack 文件使用的是 SHA-1 还是 SHA-256
+fn detect_pack_hash_kind(path: &Path) -> Option<HashKind> {
+    let idx_path = path.with_extension("idx");
+    let mut file = File::open(idx_path).ok()?;
+    let total_len = file.metadata().ok()?.len() as usize;
+
+    let mut header = [0u8; 8];
+    file.read_exact(&mut header).ok()?;
+    if header[..4] != [0xFF, 0x74, 0x4F, 0x63] {
+        return None;
+    }
+    let version = u32::from_be_bytes(header[4..8].try_into().ok()?);
+    if version != 2 {
+        return None;
+    }
+
+    let mut fanout_bytes = [0u8; 256 * 4];
+    file.read_exact(&mut fanout_bytes).ok()?;
+    let object_count =
+        u32::from_be_bytes(fanout_bytes[255 * 4..256 * 4].try_into().ok()?) as usize;
+    let prefix_len = 8 + 256 * 4;
+
+    // 根据 idx 文件的布局长度，分别尝试 SHA-1 和 SHA-256 的哈希长度
+    for kind in [HashKind::Sha1, HashKind::Sha256] {
+        let hash_len = kind.size();
+        let fixed_len = prefix_len
+            + object_count * hash_len
+            + object_count * 4
+            + object_count * 4
+            + 2 * hash_len;
+        let Some(large_offsets_len) = total_len.checked_sub(fixed_len) else {
+            continue;
+        };
+        if large_offsets_len % 8 == 0 && large_offsets_len / 8 <= object_count {
+            return Some(kind);
+        }
+    }
+
+    None
+}
+
+// 在指定哈希类型下解码 pack 文件，并收集对象数量统计信息
+fn collect_pack_stats_with_hash_kind(path: &Path, kind: HashKind) -> Result<PackStats, GitError> {
+    let previous_kind = get_hash_kind();
+    let _restore = HashKindRestore(previous_kind);
+    set_hash_kind(kind);
+
+    let file = File::open(path)?;
+    let mut reader = io::BufReader::new(file);
+    // 复用已有 pack 解码测试中的有界缓存配置，
+    // 以保证包含 delta 对象的 pack 文件也能正常处理
+    let mut pack = Pack::new(Some(2), Some(64 * 1024 * 1024), None, true);
+    let mut stats = PackStats::default();
+    pack.decode_inner(&mut reader, |_| {}, None::<fn(ObjectHash)>, |obj_type| {
+        stats.record(obj_type);
+    })?;
+    Ok(stats)
+}
+
+/// 从磁盘解码一个 pack 文件，并返回其中原始对象的数量统计
+/// 该函数复用正常的 [`Pack::decode`] 解码流程，包括 pack 头校验、
+/// 对象类型和大小解析、zlib 解压、delta 重建、waitlist 处理以及
+/// trailer 校验。额外增加的工作只是在 `decode_pack_object` 之后立即
+/// 观察原始 pack 对象类型
+/// 如果存在同名 `.idx` 文件，该函数会根据索引文件布局推断当前 pack
+/// 使用的是 SHA-1 还是 SHA-256；否则回退到当前线程本地的哈希类型
+pub fn collect_pack_stats<P: AsRef<Path>>(path: P) -> Result<PackStats, GitError> {
+    let path = path.as_ref();
+    let kind = detect_pack_hash_kind(path).unwrap_or_else(get_hash_kind);
+    collect_pack_stats_with_hash_kind(path, kind)
 }
 
 impl Drop for Pack {
@@ -410,6 +521,21 @@ impl Pack {
         F: Fn(MetaAttached<Entry, EntryMeta>) + Sync + Send + 'static,
         C: FnOnce(ObjectHash) + Send + 'static,
     {
+        self.decode_inner(pack, callback, pack_id_callback, |_| {})
+    }
+
+    fn decode_inner<F, C, O>(
+        &mut self,
+        pack: &mut (impl BufRead + Send),
+        callback: F,
+        pack_id_callback: Option<C>,
+        mut object_type_callback: O,
+    ) -> Result<(), GitError>
+    where
+        F: Fn(MetaAttached<Entry, EntryMeta>) + Sync + Send + 'static,
+        C: FnOnce(ObjectHash) + Send + 'static,
+        O: FnMut(ObjectType),
+    {
         let time = Instant::now();
         let mut last_update_time = time.elapsed().as_millis();
         let log_info = |_i: usize, pack: &Pack| {
@@ -463,6 +589,7 @@ impl Pack {
                 Pack::decode_pack_object(&mut reader, &mut offset);
             match r {
                 Ok(Some(mut obj)) => {
+                    object_type_callback(obj.object_type());
                     obj.set_mem_recorder(self.cache_objs_mem.clone());
                     obj.record_mem_size();
 
@@ -810,7 +937,7 @@ mod tests {
 
     use crate::{
         hash::{HashKind, ObjectHash, set_hash_kind_for_test},
-        internal::pack::{Pack, tests::init_logger},
+        internal::pack::{Pack, collect_pack_stats, tests::init_logger},
     };
 
     #[tokio::test]
@@ -902,6 +1029,68 @@ mod tests {
     fn test_pack_decode_with_ref_delta() {
         run_decode_with_ref_delta("tests/data/packs/ref-delta-sha1.pack", HashKind::Sha1);
         run_decode_with_ref_delta("tests/data/packs/ref-delta-sha256.pack", HashKind::Sha256);
+    }
+
+    #[test]
+    fn test_pack_stats_small_pack() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/small-sha1.pack");
+
+        let stats = collect_pack_stats(&path).expect("collect stats for small pack");
+        println!("small pack stats: {:?}", stats);
+
+        assert!(stats.total > 0);
+        assert_eq!(
+            stats.total,
+            stats.commits + stats.trees + stats.blobs + stats.tags + stats.deltas
+        );
+    }
+
+    #[test]
+    fn test_pack_stats_medium_pack() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/medium-sha1.pack");
+
+        let stats = collect_pack_stats(&path).expect("collect stats for medium pack");
+        println!("medium sha1 pack stats: {:?}", stats);
+
+        assert!(stats.total > 0);
+        assert!(stats.deltas > 0);
+        assert_eq!(
+            stats.total,
+            stats.commits + stats.trees + stats.blobs + stats.tags + stats.deltas
+        );
+    }
+
+    #[test]
+    fn test_pack_stats_sha256_pack() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/medium-sha256.pack");
+
+        let stats = collect_pack_stats(&path).expect("collect stats for sha256 medium pack");
+        println!("medium sha256 pack stats: {:?}", stats);
+
+        assert!(stats.total > 0);
+        assert!(stats.deltas > 0);
+        assert_eq!(
+            stats.total,
+            stats.commits + stats.trees + stats.blobs + stats.tags + stats.deltas
+        );
+    }
+
+    #[test]
+    fn test_pack_stats_missing_file() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/does-not-exist.pack");
+
+        let result = collect_pack_stats(&path);
+        println!("missing file stats result: {:?}", result);
+
+        assert!(result.is_err());
     }
 
     /// Helper function to run decode tests without memory limit

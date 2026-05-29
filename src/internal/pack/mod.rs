@@ -16,6 +16,8 @@ use std::sync::{Arc, atomic::AtomicUsize};
 
 use threadpool::ThreadPool;
 
+pub use decode::{PackStats, collect_pack_stats};
+
 use crate::{
     hash::ObjectHash,
     internal::{
